@@ -1,0 +1,201 @@
+#!/bin/bash
+
+# Tool to convert a ContainerFile to a VM ImageFile
+
+DISK_SIZE="2G"
+SSH_KEY=""
+
+
+function usage() {
+    echo "Usage: $(basename "$0") [-h] [-d] [-k KEYFILE] CONTAINER IMAGEFILE"
+    echo "Convert a ContainerFile to a ImageFile"
+    echo "Options:"
+    echo -e "\t-h\t\tprint this help"
+    echo -e "\t-k KEYFILE\tadd ssh key to the root account"
+    echo -e "\t-s SIZE\t disk size (default 2G)"
+    echo -e "\t-d\t\tturn on debug"
+    echo -e "\t-q\t\tgenerate a qcow2 image"
+}
+
+function fatal(){
+    1>&2 echo "$1"
+    exit 1
+}
+function setup_tools() {
+    BUILDAH=$(which buildah)
+    LOSETUP=$(which losetup)
+    SGDISK=$(which sgdisk)
+    TRUNCATE=$(which truncate)
+
+    if [[ -z "$BUILDAH" ]]; then
+        fatal "buildah binary not found"
+    fi
+
+    if [[ -z "$LOSETUP" ]]; then
+        fatal "losetup not found"
+    fi
+
+    if [[ -z "$SGDISK" ]]; then
+        fatal "sgdisk not found"
+    fi
+
+    if [[ -z "$TRUNCATE" ]]; then
+        fatal "truncate not found"
+    fi
+}
+
+
+function find_kernel() {
+    fs="$1"
+    [[ -e "$fs/vmlinuz" ]] && { echo "/vmlinuz"; return; }
+    [[ -e "$fs/boot/vmlinuz" ]] && { echo "/boot/vmlinuz"; return; }
+    [[ -e "$fs/boot/vmlinuz-linux" ]] && { echo "/boot/vmlinuz-linux"; return; }
+
+}
+
+function find_initrd() {
+    fs="$1"
+    [[ -e "$fs/initrd.img" ]] && { echo "/initrd.img"; return; }
+    [[ -e "$fs/boot/initrd.img" ]] && { echo "/boot/initrd.img"; return; }
+    [[ -e "$fs/boot/initramfs-linux-fallback.img" ]]  && { echo "/boot/initramfs-linux-fallback.img"; return; }
+
+}
+
+syslinux_cfg="DEFAULT linux\n\tSAY booting...\n\tLABEL linux\n\t\tKERNEL %s\n\t\tAPPEND rw root=UUID=%s initrd=%s\n"
+
+function deploy_syslinux_cfg() {
+    dest="$1"
+    loopdev="$2"
+
+    kernel_path=$(find_kernel "$dest")
+    initrd_path=$(find_initrd "$dest")
+
+    mkdir -p "$dest/boot/syslinux"
+    uuid=$(lsblk -nio UUID "$loopdev")
+    # shellcheck disable=SC2059
+    printf "$syslinux_cfg" "$kernel_path" "$uuid" "$initrd_path" > "$dest/boot/syslinux/syslinux.cfg"
+    extlinux -i "${IMG_MNT}/boot/syslinux/" 2> /dev/null
+
+}
+
+function wait_for_loopdev() {
+    counter=0
+    while [[ $counter -lt 5 ]]; do
+        ((counter++))
+        if [[ -e "$1" ]]; then
+            return 0
+        fi
+
+        sleep 1
+    done
+    return 1
+}
+
+function init_img() {
+    img="$1"
+    output="/dev/null"
+
+    if [[ -n "$DEBUG" ]]; then
+        output="/proc/$$/fd/2"
+    fi
+
+    $TRUNCATE -s "$DISK_SIZE" "$img"
+    $SGDISK --clear \
+        --attributes=1:set:2 \
+        --new 1::-0 --typecode=1:8300 \
+        "$img" > "$output" 2>&1
+    partprobe "$img"
+    LOOPDEV=$($LOSETUP --find --partscan --show "$img")
+    wait_for_loopdev "${LOOPDEV}p1"
+    mkfs.ext4 -F "${LOOPDEV}p1" > "$output" 2>&1
+    losetup -d "$LOOPDEV"
+}
+
+function setup_img() {
+    img="$1"
+    ctr="$2"
+
+    BUILDAH_CTR=$($BUILDAH from "$ctr")
+    CTR_MNT=$($BUILDAH mount "$BUILDAH_CTR")
+    [[ -n "$DEBUG" ]] && echo "$CTR_MNT" 
+    IMG_MNT=$(mktemp -d)
+    [[ -n "$DEBUG" ]] && echo "$IMG_MNT"
+    LOOPDEV=$($LOSETUP --find --partscan --show "$img")
+    wait_for_loopdev "${LOOPDEV}p1"
+    mount "${LOOPDEV}p1" "$IMG_MNT"
+    cp -a "$CTR_MNT"/* "$IMG_MNT"
+    $BUILDAH unmount "$BUILDAH_CTR" > /dev/null
+    $BUILDAH rm "$BUILDAH_CTR" > /dev/null
+    if [[ -n "$SSH_KEY" ]]; then
+        if ! grep -qs "$SSH_KEY" "$IMG_MNT/root/.ssh/authorized_keys"; then
+            [[ -n "$DEBUG" ]] && echo "Importing ssh key file ..."
+            mkdir -p "$IMG_MNT/root/.ssh"
+            chmod 0700 "$IMG_MNT/root/.ssh"
+            echo "$SSH_KEY" >> "$IMG_MNT/root/.ssh/authorized_keys"
+            chmod 0600 "$IMG_MNT/root/.ssh/authorized_keys"
+        fi
+    fi
+    deploy_syslinux_cfg "${IMG_MNT}" "${LOOPDEV}p1"
+    umount "$IMG_MNT"
+    rm -r "$IMG_MNT"
+    dd bs=440 count=1 conv=notrunc if=/usr/lib/syslinux/bios/gptmbr.bin of="$img" 2> /dev/null
+    losetup -d "$LOOPDEV"
+}
+
+function qcow2_img() {   
+    local src="$1"
+    local temp
+    temp=$(mktemp)
+    qemu-img convert -c -f raw -O qcow2 "$src" "$temp"
+    rm "$src" 
+    mv "$temp" "$src"
+}
+
+function main() {
+    readonly optstring=":hdqk:s:"
+    local qcow2_output=0
+    while getopts $optstring arg; do
+
+        case $arg in
+            h)
+                usage
+                exit 0
+                ;;
+            d)
+                DEBUG="1"
+                ;;
+            k)
+                [[ -e "$OPTARG" ]] || { echo "key file not found: $OPTARG"; exit 1; }
+                SSH_KEY=$(cat "$OPTARG")
+                ;;
+            s)
+                DISK_SIZE="$OPTARG"
+                ;;
+            q)
+                qcow2_output=1
+                ;;
+            ?)
+                fatal "invalid option: -$OPTARG"
+                ;;
+        esac
+    done
+
+    shift $((OPTIND -1))
+
+    if [ $# -ne 2 ]; then
+        fatal "Expected 2 arguments, got $#, see usage with -h"
+    fi
+
+    CONTAINER="$1"
+    IMG="$2"
+
+    setup_tools
+
+    init_img "$IMG"
+    setup_img "$IMG" "$CONTAINER"
+    if [[ $qcow2_output -eq 1 ]]; then
+        qcow2_img "$IMG"
+    fi
+}
+
+main "$@"
