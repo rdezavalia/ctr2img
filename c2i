@@ -54,22 +54,21 @@ setup_tools() {
     LOSETUP=$(which losetup)
     SGDISK=$(which sgdisk)
     TRUNCATE=$(which truncate)
+    SYSLINUX=$(which extlinux)
+    LSBLK=$(which lsblk)
+    PARTPROBE=$(which partprobe)
+    EXT4=$(which mkfs.ext4)
+    QEMUIMG=$(which qemu-img)
 
-    if [[ -z "$BUILDAH" ]]; then
-        fatal "buildah binary not found"
-    fi
-
-    if [[ -z "$LOSETUP" ]]; then
-        fatal "losetup not found"
-    fi
-
-    if [[ -z "$SGDISK" ]]; then
-        fatal "sgdisk not found"
-    fi
-
-    if [[ -z "$TRUNCATE" ]]; then
-        fatal "truncate not found"
-    fi
+    [[ -z "$BUILDAH" ]] && fatal "buildah binary not found"
+    [[ -z "$LOSETUP" ]] && fatal "losetup not found"
+    [[ -z "$SGDISK" ]] && fatal "sgdisk not found"
+    [[ -z "$TRUNCATE" ]] && fatal "truncate not found"
+    [[ -z "$SYSLINUX" ]] && fatal "syslinux not installed"
+    [[ -z "$LSBLK" ]] && fatal "lsblk not found"
+    [[ -z "$PARTPROBE" ]] && fatal "partprobe not found"
+    [[ -z "$EXT4" ]] && fatal "mkfs.ext4 not found"
+    [[ -z "$QEMUIMG" ]] && fatal "qemu-img not found"
 }
 
 
@@ -98,12 +97,12 @@ deploy_syslinux_cfg() {
     local -r kernel_path=$(find_kernel "$dest")
     local -r initrd_path=$(find_initrd "$dest")
 
-    local -r uuid=$(lsblk -nio UUID "$loopdev")
+    local -r uuid=$($LSBLK -nio UUID "$loopdev")
     mkdir -p "$dest/boot/syslinux"
     # shellcheck disable=SC2059
     printf "$syslinux_cfg" "$kernel_path" "$uuid" "$initrd_path" > "$dest/boot/syslinux/syslinux.cfg"
     [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "install syslinux into the image file..."
-    extlinux -i "${IMG_MNT}/boot/syslinux/" 2> /dev/null
+    $SYSLINUX -i "${IMG_MNT}/boot/syslinux/" 2> /dev/null
 
 }
 
@@ -140,13 +139,13 @@ init_img() {
         "$img" > "$output" 2>&1
     [[ "$DEBUG" -ge $DEBUG_L2 ]] && echo "------------------------"
     [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "running partprobe..."
-    partprobe "$img"
+    $PARTPROBE "$img"
     loopdev=$($LOSETUP --find --partscan --show "$img")
     atexit "losetup -d $loopdev"
     wait_for_loopdev "${loopdev}p1"
     [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "format the partition..."
     [[ "$DEBUG" -ge $DEBUG_L2 ]] && echo -e "\n---- mkfs.ext4 output -----"
-    mkfs.ext4 -F "${loopdev}p1" > "$output" 2>&1
+    $EXT4 -F "${loopdev}p1" > "$output" 2>&1
     [[ "$DEBUG" -ge $DEBUG_L2 ]] && echo "------------------------"
 }
 
@@ -193,7 +192,7 @@ qcow2_img() {
     local temp
     temp=$(mktemp)
     [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "generating qcow2 image ..."
-    qemu-img convert -c -f raw -O qcow2 "$src" "$temp"
+    $QEMUIMG convert -c -f raw -O qcow2 "$src" "$temp"
     rm "$src" 
     mv "$temp" "$src"
 }
