@@ -2,26 +2,54 @@
 
 # Tool to convert a ContainerFile to a VM ImageFile
 
+trap atexit_reverse_handler EXIT
+
 DISK_SIZE="2G"
 SSH_KEY=""
+DEBUG=0
+readonly DEBUG_L1=1
+readonly DEBUG_L2=10
 
+ATEXIT=()
 
-function usage() {
+atexit_reverse_handler() {
+  local EXPR
+  for (( idx=${#ATEXIT[@]}-1 ; idx>=0 ; idx-- )) ; do
+    EXPR="${ATEXIT[idx]}"
+    [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "cleanup: $EXPR"
+    eval "$EXPR" || true
+  done
+}
+
+atexit () {
+  local EXPR
+  for EXPR in "$@"; do
+    ATEXIT+=("$EXPR")
+  done
+}
+
+usage() {
     echo "Usage: $(basename "$0") [-h] [-d] [-k KEYFILE] CONTAINER IMAGEFILE"
     echo "Convert a ContainerFile to a ImageFile"
     echo "Options:"
     echo -e "\t-h\t\tprint this help"
     echo -e "\t-k KEYFILE\tadd ssh key to the root account"
     echo -e "\t-s SIZE\t disk size (default 2G)"
-    echo -e "\t-d\t\tturn on debug"
+    echo -e "\t-d\t\tturn on debug (use it multiple times to increse debug info)"
     echo -e "\t-q\t\tgenerate a qcow2 image"
+    echo "Example:"
+    echo -e "\tCreate a 10G ubuntu image with your ssh key on it"
+    echo -e "\t# $(basename "$0") -s 10G -k ~/.ssh/id_rsa.pub localhost/ubuntu-base-vm /opt/images/ubuntu-base.img"
+    echo -e "\tCreate an ubuntu image with qcow2 format"
+    echo -e "\t# $(basename "$0") -q localhost/ubuntu-base-vm /opt/images/ubuntu-base.qcow2"
 }
 
-function fatal(){
+fatal(){
     1>&2 echo "$1"
     exit 1
 }
-function setup_tools() {
+
+setup_tools() {
     BUILDAH=$(which buildah)
     LOSETUP=$(which losetup)
     SGDISK=$(which sgdisk)
@@ -45,41 +73,42 @@ function setup_tools() {
 }
 
 
-function find_kernel() {
-    fs="$1"
+find_kernel() {
+    local -r fs="$1"
     [[ -e "$fs/vmlinuz" ]] && { echo "/vmlinuz"; return; }
     [[ -e "$fs/boot/vmlinuz" ]] && { echo "/boot/vmlinuz"; return; }
     [[ -e "$fs/boot/vmlinuz-linux" ]] && { echo "/boot/vmlinuz-linux"; return; }
 
 }
 
-function find_initrd() {
-    fs="$1"
+find_initrd() {
+    local -r fs="$1"
     [[ -e "$fs/initrd.img" ]] && { echo "/initrd.img"; return; }
     [[ -e "$fs/boot/initrd.img" ]] && { echo "/boot/initrd.img"; return; }
     [[ -e "$fs/boot/initramfs-linux-fallback.img" ]]  && { echo "/boot/initramfs-linux-fallback.img"; return; }
 
 }
 
-syslinux_cfg="DEFAULT linux\n\tSAY booting...\n\tLABEL linux\n\t\tKERNEL %s\n\t\tAPPEND rw root=UUID=%s initrd=%s\n"
+deploy_syslinux_cfg() {
+    local -r dest="$1"
+    local -r loopdev="$2"
 
-function deploy_syslinux_cfg() {
-    dest="$1"
-    loopdev="$2"
+    local -r syslinux_cfg="DEFAULT linux\n\tSAY booting...\n\tLABEL linux\n\t\tKERNEL %s\n\t\tAPPEND rw root=UUID=%s initrd=%s\n"
 
-    kernel_path=$(find_kernel "$dest")
-    initrd_path=$(find_initrd "$dest")
+    local -r kernel_path=$(find_kernel "$dest")
+    local -r initrd_path=$(find_initrd "$dest")
 
+    local -r uuid=$(lsblk -nio UUID "$loopdev")
     mkdir -p "$dest/boot/syslinux"
-    uuid=$(lsblk -nio UUID "$loopdev")
     # shellcheck disable=SC2059
     printf "$syslinux_cfg" "$kernel_path" "$uuid" "$initrd_path" > "$dest/boot/syslinux/syslinux.cfg"
+    [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "install syslinux into the image file..."
     extlinux -i "${IMG_MNT}/boot/syslinux/" 2> /dev/null
 
 }
 
-function wait_for_loopdev() {
-    counter=0
+wait_for_loopdev() {
+    local counter=0
     while [[ $counter -lt 5 ]]; do
         ((counter++))
         if [[ -e "$1" ]]; then
@@ -91,68 +120,86 @@ function wait_for_loopdev() {
     return 1
 }
 
-function init_img() {
-    img="$1"
-    output="/dev/null"
+init_img() {
+    local -r img="$1"
+    local output="/dev/null"
+    local loopdev
 
-    if [[ -n "$DEBUG" ]]; then
+    if [[ "$DEBUG" -ge $DEBUG_L2 ]]; then
         output="/proc/$$/fd/2"
     fi
 
+    [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "Creating image file..."
     $TRUNCATE -s "$DISK_SIZE" "$img"
+    [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "partition the image file..."
+
+    [[ "$DEBUG" -ge $DEBUG_L2 ]] && echo -e "\n---- sgdisk output -----"
     $SGDISK --clear \
         --attributes=1:set:2 \
         --new 1::-0 --typecode=1:8300 \
         "$img" > "$output" 2>&1
+    [[ "$DEBUG" -ge $DEBUG_L2 ]] && echo "------------------------"
+    [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "running partprobe..."
     partprobe "$img"
-    LOOPDEV=$($LOSETUP --find --partscan --show "$img")
-    wait_for_loopdev "${LOOPDEV}p1"
-    mkfs.ext4 -F "${LOOPDEV}p1" > "$output" 2>&1
-    losetup -d "$LOOPDEV"
+    loopdev=$($LOSETUP --find --partscan --show "$img")
+    atexit "losetup -d $loopdev"
+    wait_for_loopdev "${loopdev}p1"
+    [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "format the partition..."
+    [[ "$DEBUG" -ge $DEBUG_L2 ]] && echo -e "\n---- mkfs.ext4 output -----"
+    mkfs.ext4 -F "${loopdev}p1" > "$output" 2>&1
+    [[ "$DEBUG" -ge $DEBUG_L2 ]] && echo "------------------------"
 }
 
-function setup_img() {
-    img="$1"
-    ctr="$2"
+setup_img() {
+    local -r img="$1"
+    local -r ctr="$2"
+    local bctrid
+    local bmntid
+    local imgmnt
+    local loopdev
 
-    BUILDAH_CTR=$($BUILDAH from "$ctr")
-    CTR_MNT=$($BUILDAH mount "$BUILDAH_CTR")
-    [[ -n "$DEBUG" ]] && echo "$CTR_MNT" 
-    IMG_MNT=$(mktemp -d)
-    [[ -n "$DEBUG" ]] && echo "$IMG_MNT"
-    LOOPDEV=$($LOSETUP --find --partscan --show "$img")
-    wait_for_loopdev "${LOOPDEV}p1"
-    mount "${LOOPDEV}p1" "$IMG_MNT"
-    cp -a "$CTR_MNT"/* "$IMG_MNT"
-    $BUILDAH unmount "$BUILDAH_CTR" > /dev/null
-    $BUILDAH rm "$BUILDAH_CTR" > /dev/null
+    bctrid=$($BUILDAH from "$ctr")  
+    [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "getting the container - id: $bctrid"
+    bmntid=$($BUILDAH mount "$bctrid")
+    [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "mount the container - id: $bmntid"
+    imgmnt=$(mktemp -d)
+    atexit "rm -r $imgmnt"
+    loopdev=$($LOSETUP --find --partscan --show "$img")
+    atexit "losetup -d $loopdev"
+    wait_for_loopdev "${loopdev}p1"
+    mount "${loopdev}p1" "$imgmnt"
+    [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "mount the image - dir: $imgmnt"
+    atexit "umount $imgmnt"
+    [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "coping the container into the image file..."
+    cp -a "$bmntid"/* "$imgmnt"
+    $BUILDAH unmount "$bctrid" > /dev/null
+    $BUILDAH rm "$bctrid" > /dev/null
     if [[ -n "$SSH_KEY" ]]; then
-        if ! grep -qs "$SSH_KEY" "$IMG_MNT/root/.ssh/authorized_keys"; then
-            [[ -n "$DEBUG" ]] && echo "Importing ssh key file ..."
-            mkdir -p "$IMG_MNT/root/.ssh"
-            chmod 0700 "$IMG_MNT/root/.ssh"
-            echo "$SSH_KEY" >> "$IMG_MNT/root/.ssh/authorized_keys"
-            chmod 0600 "$IMG_MNT/root/.ssh/authorized_keys"
+        if ! grep -qs "$SSH_KEY" "$imgmnt/root/.ssh/authorized_keys"; then
+            [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "Importing ssh key file ..."
+            mkdir -p "$imgmnt/root/.ssh"
+            chmod 0700 "$imgmnt/root/.ssh"
+            echo "$SSH_KEY" >> "$imgmnt/root/.ssh/authorized_keys"
+            chmod 0600 "$imgmnt/root/.ssh/authorized_keys"
         fi
     fi
-    deploy_syslinux_cfg "${IMG_MNT}" "${LOOPDEV}p1"
-    umount "$IMG_MNT"
-    rm -r "$IMG_MNT"
+    deploy_syslinux_cfg "${imgmnt}" "${loopdev}p1"
+    [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "writing the mbr into the image file..."
     dd bs=440 count=1 conv=notrunc if=/usr/lib/syslinux/bios/gptmbr.bin of="$img" 2> /dev/null
-    losetup -d "$LOOPDEV"
 }
 
-function qcow2_img() {   
+qcow2_img() {   
     local src="$1"
     local temp
     temp=$(mktemp)
+    [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "generating qcow2 image ..."
     qemu-img convert -c -f raw -O qcow2 "$src" "$temp"
     rm "$src" 
     mv "$temp" "$src"
 }
 
-function main() {
-    readonly optstring=":hdqk:s:"
+main() {
+    readonly optstring=":hdDqk:s:"
     local qcow2_output=0
     while getopts $optstring arg; do
 
@@ -162,7 +209,7 @@ function main() {
                 exit 0
                 ;;
             d)
-                DEBUG="1"
+                DEBUG=$((DEBUG+5))
                 ;;
             k)
                 [[ -e "$OPTARG" ]] || { echo "key file not found: $OPTARG"; exit 1; }
@@ -186,14 +233,14 @@ function main() {
         fatal "Expected 2 arguments, got $#, see usage with -h"
     fi
 
-    CONTAINER="$1"
-    IMG="$2"
+    local CONTAINER="$1"
+    local IMG="$2"
 
     setup_tools
 
     init_img "$IMG"
     setup_img "$IMG" "$CONTAINER"
-    if [[ $qcow2_output -eq 1 ]]; then
+    if [[ $qcow2_output -ge 1 ]]; then
         qcow2_img "$IMG"
     fi
 }
