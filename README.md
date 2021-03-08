@@ -4,7 +4,7 @@
 
 **c2i** is a tool that let's  you build your linux vm's images using any [OCI](https://opencontainers.org/) compatible build tool.
 
-All you need is a container with a valid linux kernel and init process (ex systemd)
+All you need is a container with a valid linux kernel and init process (e.g. systemd)
 
 ## Usage
 
