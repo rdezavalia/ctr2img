@@ -102,7 +102,7 @@ deploy_syslinux_cfg() {
     # shellcheck disable=SC2059
     printf "$syslinux_cfg" "$kernel_path" "$uuid" "$initrd_path" > "$dest/boot/syslinux/syslinux.cfg"
     [[ "$DEBUG" -ge $DEBUG_L1 ]] && echo "install syslinux into the image file..."
-    $SYSLINUX -i "${IMG_MNT}/boot/syslinux/" 2> /dev/null
+    $SYSLINUX -i "${dest}/boot/syslinux/" 2> /dev/null
 
 }
 
